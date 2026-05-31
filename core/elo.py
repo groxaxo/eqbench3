@@ -28,7 +28,6 @@ from .elo_config import (
     MAX_STAGE_LOOPS,
     WIN_MARGIN_BIN_SIZE,
     WIN_MARGIN_BIN_SIZE_FOR_CI,
-    RANK_WINDOW,
     scenario_notes, # Import the global variable
     analysis_scenario_notes # Import the global variable
 )
@@ -65,40 +64,6 @@ def _is_valid_comp(c: Dict[str, Any]) -> bool:
 def filter_comparisons_for_solver(comps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Basic validity filter (ignores rank window)."""
     return [c for c in comps if _is_valid_comp(c)]
-
-
-def filter_comps_within_rank_window(
-    comps: List[Dict[str, Any]],
-    elo_snapshot: Dict[str, float],
-    window: int,
-) -> List[Dict[str, Any]]:
-    """
-    Keep only comps where the two models are ≤ *window* ladder positions apart.
-    *elo_snapshot* is a dict {model: rating}.
-    """
-    ladder = sorted(elo_snapshot, key=elo_snapshot.get)        # lowest → highest
-    pos = {m: i for i, m in enumerate(ladder)}
-
-    def _ok(pair: Dict[str, Any]) -> bool:
-        a, b = pair.get("test_model"), pair.get("neighbor_model")
-        return (a in pos and b in pos and abs(pos[a] - pos[b]) <= window)
-
-    return [c for c in comps if _ok(c.get("pair", {}))]
-
-
-def get_solver_comparisons(
-    comps: List[Dict[str, Any]],
-    elo_snapshot: Optional[Dict[str, float]] = None,
-    rank_window: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """
-    1. Applies the basic validity filter.
-    2. If *rank_window* is given, applies the ±window filter using *elo_snapshot*.
-    """
-    valid = filter_comparisons_for_solver(comps)
-    if rank_window is not None and elo_snapshot is not None:
-        return filter_comps_within_rank_window(valid, elo_snapshot, rank_window)
-    return valid
 
 
 def models_in_comparisons(comps: List[Dict[str, Any]]) -> Set[str]:
@@ -292,7 +257,8 @@ def run_elo_analysis_eqbench3(
             debug=False,
             use_fixed_initial_ratings=True, # Use current estimates as starting point
             bin_size=WIN_MARGIN_BIN_SIZE, # Default bin size
-            return_sigma=True
+            return_sigma=True,
+            shuffle_iterations=3,  # fewer iterations during ladder traversal
         )
         return mu_map, sigma_map
 
@@ -428,14 +394,9 @@ def run_elo_analysis_eqbench3(
 
 
             # --- Re-solve ratings (using FULL merged comparison list) -------------
-            rank_window = RANK_WINDOW if stage_idx > 1 else None
-            comps_for_solver = get_solver_comparisons(
-                all_comparisons_global,
-                elo_snapshot if rank_window else None,
-                rank_window,
-            )
+            comps_for_solver = filter_comparisons_for_solver(all_comparisons_global)
 
-            # Solve using the potentially filtered list
+            # Solve using the filtered list
             if comps_for_solver:
                 # Solver uses logical names
                 new_mu_map, _ = _solve_for_elo(comps_for_solver) # Ignore sigma map for stability check
@@ -508,12 +469,7 @@ def run_elo_analysis_eqbench3(
 
     try:
         # Filter out ignored scenarios and errors for the final solve
-        # Filter out ignored scenarios/errors **and** apply the rank window
-        final_comps_for_solver = get_solver_comparisons(
-            all_comparisons_global,
-            elo_snapshot,          # current ladder snapshot built earlier
-            rank_window=rank_window
-        )
+        final_comps_for_solver = filter_comparisons_for_solver(all_comparisons_global)
 
         if final_comps_for_solver:
             # Determine the set of all models involved in valid comparisons for the final solve

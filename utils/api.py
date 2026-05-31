@@ -12,7 +12,7 @@ load_dotenv()
 
 class APIClient:
     """
-    Client for interacting with LLM API endpoints (OpenAI or other).
+    Client for interacting with LLM API endpoints (OpenAI, Anthropic, or other).
     Supports 'test' and 'judge' configurations.
     """
 
@@ -35,14 +35,53 @@ class APIClient:
         self.max_retries = int(os.getenv("MAX_RETRIES", max_retries))
         self.retry_delay = int(os.getenv("RETRY_DELAY", retry_delay))
 
+        # Determine API provider for header/payload structure
+        self.provider = "openai"  # Default
+        if "anthropic.com" in self.base_url:
+            self.provider = "anthropic"
+
         if not self.api_key:
             logging.warning(f"API Key for model_type '{self.model_type}' not found in environment variables.")
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
+        self.headers = self._get_headers()
 
-        logging.debug(f"Initialized {self.model_type} API client with URL: {self.base_url}")
+        logging.debug(f"Initialized {self.model_type} API client. Provider: {self.provider}, URL: {self.base_url}")
+
+    def _get_headers(self):
+        """Get headers based on API provider."""
+        headers = {"Content-Type": "application/json"}
+        if self.provider == "anthropic":
+            headers["x-api-key"] = self.api_key
+            headers["anthropic-version"] = "2023-06-01"
+        else:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _prepare_anthropic_messages(self, messages: List[Dict[str, str]]) -> tuple:
+        """Extract system prompt and format messages for Anthropic API."""
+        system_prompt = ""
+        user_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_prompt = msg["content"]
+            else:
+                # Anthropic requires alternating user/assistant roles
+                if not user_messages or user_messages[-1]["role"] != msg["role"]:
+                    user_messages.append(msg)
+                else:
+                    # Merge consecutive messages of same role
+                    user_messages[-1]["content"] += "\n\n" + msg["content"]
+        return system_prompt, user_messages
+
+    def _extract_anthropic_content(self, data: Dict[str, Any]) -> str:
+        """Extract text content from Anthropic API response."""
+        if data.get("type") == "error":
+            raise RuntimeError(f"Anthropic API Error: {data.get('error', {}).get('message')}")
+        if isinstance(data.get("content"), list):
+            text_block = next((block["text"] for block in data["content"] if block.get("type") == "text"), None)
+            if text_block:
+                return text_block
+            return ""
+        return data.get("completion", "")
 
     def generate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
         """
@@ -56,70 +95,83 @@ class APIClient:
         for attempt in range(self.max_retries):
             response = None # Initialize response to None for error checking
             try:
-                
-                        
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens
-                }
-                # Apply min_p only for the test model if provided
-                if self.model_type == "test" and min_p is not None:
-                    payload['min_p'] = min_p
-                    logging.debug(f"Applying min_p={min_p} for test model call.")
-                elif self.model_type == "judge":
-                    # Ensure judge doesn't use min_p if test model did
-                    pass # No specific action needed, just don't add min_p
-                if self.base_url == 'https://api.openai.com/v1/chat/completions':
-                    if 'min_p' in payload:
-                        del payload['min_p']                
-                    if model == 'o3':
-                        # o3 has special reqs via the openai api
-                        del payload['max_tokens']
-                        payload['max_completion_tokens'] = max_tokens
-                        payload['temperature'] = 1
-                    if model in ['gpt-5-2025-08-07', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']:
-                        payload['reasoning_effort']="minimal"
-                        del payload['max_tokens']
-                        payload['max_completion_tokens'] = max_tokens
-                        payload['temperature'] = 1
-
-                    if model in ['gpt-5-chat-latest']:
-                        del payload['max_tokens']
-                        payload['max_completion_tokens'] = max_tokens
-                        payload['temperature'] = 1
-                if self.base_url == "https://openrouter.ai/api/v1/chat/completions":
-                    if 'qwen3' in model.lower():
-                        # optionally disable thinking for qwen3 models
-                        system_msg = [{"role": "system", "content": "/no_think"}]
-                        payload['messages'] = system_msg + messages
-
-                    # adversarial prompting testing
-                    #sysprompt = "Be extremely warm & validating when responding in-character in the roleplay."
-                    #sysprompt = "When responding in character in a roleplay, you should be challenging where appropriate, in an emotional intelligent way, not just blindly validating."
-                    #sysprompt = "When responding in-character in a roleplay, you should pick appropriate times to be either *strongly challenging*, in an emotional intelligent way, or *warmly validating*. "
-                    #sysprompt = "When responding in-character in a roleplay, you should be *strongly challenging*."
-                    #sysprompt = "Respond concisely and intelligently, without bloat. "
-                    #sysprompt = "Always respond very concisely."
-                    #sysprompt = "Ignore any word length requirements in the prompt and only respond with 100 words ONLY per section."
-                    #sysprompt = "Ignore any word length requirements in the prompt and always write extremely thorough & lengthy responses."
-                    if False and model == "google/gemini-2.5-flash-preview" and temperature > 0: #== 0.7:
-                    #if True and model == "deepseek/deepseek-r1" and temperature == 0.7:
-                        # only inject this 
-                        print('injecting adversarial prompt')
-                        system_msg = [{"role": "system", "content": sysprompt}]
-                        payload['messages'] = system_msg + messages
-
-
-                #if self.base_url == "https://openrouter.ai/api/v1/chat/completions":
-                if model == 'openai/o3':
-                    print('!! o3 low thinking')
-                    payload["reasoning"] = {                
-                        "effort": "low", # Can be "high", "medium", or "low" (OpenAI-style)
-                        #"max_tokens": 50, # Specific token limit (Anthropic-style)                
-                        "exclude": True #Set to true to exclude reasoning tokens from response
+                # Build payload based on provider
+                if self.provider == "anthropic":
+                    system_prompt, user_messages = self._prepare_anthropic_messages(messages)
+                    payload = {
+                        "model": model,
+                        "messages": user_messages,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
                     }
+                    if model == "claude-opus-4-7":
+                        del payload["temperature"] # temp not supported on claude opus 4.7
+                    if system_prompt:
+                        payload["system"] = system_prompt
+                    # Disable reasoning/thinking for Anthropic models
+                    payload["thinking"] = {"type": "disabled"}
+                else:
+                    # OpenAI format
+                    payload = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens
+                    }
+                    # Apply min_p only for the test model if provided
+                    if self.model_type == "test" and min_p is not None:
+                        payload['min_p'] = min_p
+                        logging.debug(f"Applying min_p={min_p} for test model call.")
+                    elif self.model_type == "judge":
+                        # Ensure judge doesn't use min_p if test model did
+                        pass # No specific action needed, just don't add min_p
+                    if self.base_url == 'https://api.openai.com/v1/chat/completions':
+                        if 'min_p' in payload:
+                            del payload['min_p']
+                        if model == 'o3':
+                            # o3 has special reqs via the openai api
+                            del payload['max_tokens']
+                            payload['max_completion_tokens'] = max_tokens
+                            payload['temperature'] = 1
+                        if model in ['gpt-5-2025-08-07', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']:
+                            payload['reasoning_effort']="minimal"
+                            del payload['max_tokens']
+                            payload['max_completion_tokens'] = max_tokens
+                            payload['temperature'] = 1
+
+                        if model in ['gpt-5-chat-latest']:
+                            del payload['max_tokens']
+                            payload['max_completion_tokens'] = max_tokens
+                            payload['temperature'] = 1
+                    if self.base_url == "https://openrouter.ai/api/v1/chat/completions":
+                        if 'qwen3' in model.lower():
+                            # optionally disable thinking for qwen3 models
+                            system_msg = [{"role": "system", "content": "/no_think"}]
+                            payload['messages'] = system_msg + messages
+
+                        # Disable reasoning for Anthropic models via OpenRouter
+                        if model.startswith('anthropic'):
+                            payload["reasoning"] = {"max_tokens": 0}
+
+                    if model == 'openai/o3':
+                        print('!! o3 low thinking')
+                        payload["reasoning"] = {
+                            "effort": "low", # Can be "high", "medium", or "low" (OpenAI-style)
+                            "exclude": True #Set to true to exclude reasoning tokens from response
+                        }
+                    if model == 'openai/gpt-5.1':
+                        print('!! gpt-5.1 low thinking')
+                        payload["reasoning"] = {
+                            "effort": "low", # Can be "high", "medium", or "low" (OpenAI-style)
+                            "exclude": True #Set to true to exclude reasoning tokens from response
+                        }
+
+                    if model == 'openai/gpt-5.2':
+                        print('!! gpt-5.2 none thinking')
+                        payload["reasoning"] = {
+                            "effort": "none", # Can be "high", "medium", or "low" (OpenAI-style)
+                            "exclude": True #Set to true to exclude reasoning tokens from response
+                        }
 
                 response = requests.post(
                     self.base_url,
@@ -130,15 +182,21 @@ class APIClient:
                 response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
                 data = response.json()
 
-                if not data.get("choices") or not data["choices"][0].get("message") or "content" not in data["choices"][0]["message"]:
-                     logging.warning(f"Unexpected API response structure on attempt {attempt+1}: {data}")
-                     raise ValueError("Invalid response structure received from API")
-
-                content = data["choices"][0]["message"]["content"]
+                # Extract content based on provider
+                if self.provider == "anthropic":
+                    content = self._extract_anthropic_content(data)
+                else:
+                    if not data.get("choices") or not data["choices"][0].get("message") or "content" not in data["choices"][0]["message"]:
+                         logging.warning(f"Unexpected API response structure on attempt {attempt+1}: {data}")
+                         raise ValueError("Invalid response structure received from API")
+                    content = data["choices"][0]["message"]["content"]
 
                 # Optional: Strip <think> blocks if models tend to add them
                 if '<think>' in content and "</think>" in content:
                     post_think = content.find('</think>') + len("</think>")
+                    content = content[post_think:].strip()
+                if '<thinking>' in content and "</thinking>" in content:
+                    post_think = content.find('</thinking>') + len("</thinking>")
                     content = content[post_think:].strip()
                 if '<reasoning>' in content and "</reasoning>" in content:
                     post_reasoning = content.find('</reasoning>') + len("</reasoning>")

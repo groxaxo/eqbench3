@@ -48,7 +48,9 @@ def print_summary_box(run_key: str, local_runs_file: str, run_elo: bool, run_rub
         # Use model_name if available, fallback to test_model (legacy), then api_model_id
         model_name = run_data.get("model_name", run_data.get("test_model", "N/A"))
         api_model_id = run_data.get("api_model_id", "N/A")
-        judge_model = run_data.get("judge_model", "N/A") # Judge model used for ELO and Rubric
+        judge_model = run_data.get("judge_model", "N/A") # Judge model used for ELO and Rubric (legacy)
+        rubric_judge_model = run_data.get("rubric_judge_model")
+        elo_judge_model = run_data.get("elo_judge_model")
         start_time_str = run_data.get("start_time")
         end_time_str = run_data.get("end_time")
         run_status = run_data.get("status", "Unknown")
@@ -145,11 +147,10 @@ def print_summary_box(run_key: str, local_runs_file: str, run_elo: bool, run_rub
             ("Model Name:",            model_name), # Changed label
             ("API Model ID:",          api_model_id), # Added API ID
         ]
-        if run_elo or run_rubric:
-            lbl_bits = []
-            if run_rubric: lbl_bits.append("Rubric")
-            if run_elo:   lbl_bits.append("ELO")
-            rows.append((f"Judge ({'/'.join(lbl_bits)}):", judge_model))
+        if run_rubric:
+            rows.append(("Judge (Rubric):", rubric_judge_model or judge_model))
+        if run_elo:
+            rows.append(("Judge (ELO):", elo_judge_model or judge_model))
 
         rows.extend([
             ("Status:",                run_status),
@@ -488,6 +489,94 @@ def _reset_model_data(model_name: str, local_runs_file: str, local_elo_file: str
         logging.info(f"[RESET] No data found for '{model_name}' in local ELO file: {local_elo_file}")
 
 
+def _redo_elo_for_model(model_name: str,
+                        local_runs_file: str,
+                        local_elo_file: str,
+                        leaderboard_runs_file: str,
+                        leaderboard_elo_file: str):
+    """
+    Purge all ELO comparisons for *model_name* so that ELO judging is
+    re-done from scratch on the next (resumed) run.
+
+    Algorithm:
+        1. Unmerge ALL models from canonical -> local
+        2. Purge every comparison involving *model_name* from local
+        3. Merge back only the models that were originally in canonical
+           (minus *model_name*), so pre-existing local models are untouched
+        4. Recalculate canonical ELO after the merge-back
+        5. Atomically save all four files
+    """
+    import copy
+    from utils.merge_utils import (
+        unmerge_data, merge_data, purge_model_comparisons,
+        _recalculate_elo_ratings, _atomic_multi_save,
+    )
+
+    logging.info(f"[REDO-ELO] Starting ELO reset for model '{model_name}'")
+
+    # --- Load all four files ---
+    canonical_runs = load_json_file(leaderboard_runs_file) or {}
+    canonical_elo  = load_json_file(leaderboard_elo_file)  or {}
+    local_runs     = load_json_file(local_runs_file)       or {}
+    local_elo      = load_json_file(local_elo_file)        or {}
+    for d in [canonical_runs, canonical_elo, local_runs, local_elo]:
+        d.setdefault("__metadata__", {})
+
+    # Work on deep copies so we can abort without touching originals
+    canonical_runs_c = copy.deepcopy(canonical_runs)
+    canonical_elo_c  = copy.deepcopy(canonical_elo)
+    local_runs_c     = copy.deepcopy(local_runs)
+    local_elo_c      = copy.deepcopy(local_elo)
+
+    # --- Step 1: record which models are currently in canonical ---
+    originally_canonical = set(k for k in canonical_elo_c if k != "__metadata__")
+    logging.info(f"[REDO-ELO] {len(originally_canonical)} models currently in canonical")
+
+    # --- Step 2: unmerge ALL canonical -> local ---
+    if originally_canonical:
+        all_candidates = [{"model_name": m, "run_keys": []} for m in originally_canonical]
+        if not unmerge_data(all_candidates, local_runs_c, local_elo_c,
+                            canonical_runs_c, canonical_elo_c):
+            logging.error("[REDO-ELO] Unmerge failed. Aborting.")
+            sys.exit(1)
+
+    # --- Step 3: purge target model's comparisons + ELO entry from local ---
+    purge_model_comparisons(local_elo_c, model_name)
+
+    # --- Step 4: merge back only the originally-canonical models (minus target) ---
+    models_to_merge_back = originally_canonical - {model_name}
+    if models_to_merge_back:
+        merge_candidates = [{"run_key": "redo-elo", "model_name": m}
+                            for m in models_to_merge_back]
+        if not merge_data(merge_candidates, local_runs_c, local_elo_c,
+                          canonical_runs_c, canonical_elo_c):
+            logging.error("[REDO-ELO] Merge-back failed. Aborting.")
+            sys.exit(1)
+
+        # Recalculate canonical ELO after merge-back
+        logging.info("[REDO-ELO] Recalculating canonical ELO after merge-back...")
+        if not _recalculate_elo_ratings(canonical_elo_c):
+            logging.error("[REDO-ELO] Canonical ELO recalculation failed. Aborting.")
+            sys.exit(1)
+
+    # --- Step 5: atomically save all four files ---
+    files_to_save = {
+        local_runs_file:       local_runs_c,
+        local_elo_file:        local_elo_c,
+    }
+    # Only include canonical files if they were actually loaded (not --ignore-canonical)
+    if leaderboard_runs_file:
+        files_to_save[leaderboard_runs_file] = canonical_runs_c
+    if leaderboard_elo_file:
+        files_to_save[leaderboard_elo_file] = canonical_elo_c
+    if not _atomic_multi_save(files_to_save):
+        logging.error("[REDO-ELO] Atomic save failed. No files were modified.")
+        sys.exit(1)
+
+    logging.info(f"[REDO-ELO] Successfully purged ELO data for '{model_name}'. "
+                 f"ELO judging will be re-done on the resumed run.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run EQBench3 Scenario Benchmark.")
     # --- Model Identifiers ---
@@ -521,6 +610,12 @@ def main():
         action="store_true",
         default=False,
         help="Delete all existing run data and ELO comparisons for the logical model name from the LOCAL files before running.",
+    )
+    parser.add_argument(
+        "--redo-elo",
+        action="store_true",
+        default=False,
+        help="Purge all ELO comparisons for the model (from both canonical and local), then resume the run so ELO judging is re-done from scratch. Requires --run-id.",
     )
     # --- Removed file path arguments (now handled via constants) ---
     # parser.add_argument("--scenario-prompts-file", ...)
@@ -564,6 +659,17 @@ def main():
     if args.reset_model:
         # Reset using the logical model name and LOCAL file paths
         _reset_model_data(logical_model_name, args.runs_file, args.elo_results_file)
+
+    if args.redo_elo:
+        if not args.run_id:
+            parser.error("--redo-elo requires --run-id to resume the existing run after purging ELO data.")
+        _redo_elo_for_model(
+            model_name=logical_model_name,
+            local_runs_file=args.runs_file,
+            local_elo_file=args.elo_results_file,
+            leaderboard_runs_file=actual_leaderboard_runs_file,
+            leaderboard_elo_file=actual_leaderboard_elo_file,
+        )
 
     # Validate arguments
     run_elo_flag = not args.no_elo

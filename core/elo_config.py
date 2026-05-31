@@ -41,9 +41,9 @@ SAMPLING_SCHEDULE: List[Tuple[Tuple[Optional[int], ...], int]] = [
     #   ±2 neighbours:        m/2 = 20
     #   ±3 neighbours:        m/4 = 10
     # 45 items is max depth
-    #((1, 2, 3), 32), 
+    ((1, 2, 3), 32), 
     #((1, 2, 3), 45), 
-    ((1, 2, 3), 9999), # for comprehensive round, we run matchups to full depth (all iterations)
+    #((1, 2, 3), 9999), # for comprehensive round, we run matchups to full depth (all iterations)
 ]
 MAX_STAGE_LOOPS   = 4          # safety guard per stage
 

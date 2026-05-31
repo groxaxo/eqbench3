@@ -532,6 +532,8 @@ def run_eq_bench3(
             "api_model_id": api_model_id, # Store API ID
             "test_model": model_name, # Store logical name in legacy field
             "judge_model": judge_model if (run_elo or run_rubric) else "N/A",
+            "rubric_judge_model": judge_model if run_rubric else "N/A",
+            "elo_judge_model": judge_model if run_elo else "N/A",
             "start_time": datetime.now(timezone.utc).isoformat(),
             "status": "initializing",
             # Store paths used for reference (using constants)
@@ -997,7 +999,7 @@ def run_eq_bench3(
         current_results["average_rubric_score"] = avg_rubric_score if avg_rubric_score is not None else "N/A"
         current_results["rubric_calculation_time"] = datetime.now(timezone.utc).isoformat()
         current_results["rubric_error"] = rubric_err
-        update_run_data(local_runs_file, run_key, {"results": current_results})
+        update_run_data(local_runs_file, run_key, {"results": current_results, "rubric_judge_model": judge_model})
 
         if rubric_err: logging.error(f"Rubric score calculation failed: {rubric_err}")
         elif avg_rubric_score is not None: logging.info(f"Final Average Rubric Score: {avg_rubric_score:.2f}")
@@ -1068,7 +1070,7 @@ def run_eq_bench3(
                 "elo_calculation_time": datetime.now(timezone.utc).isoformat(),
                 "elo_error": elo_error_msg # Store error message from ELO run
             })
-            update_run_data(local_runs_file, run_key, {"results": current_results})
+            update_run_data(local_runs_file, run_key, {"results": current_results, "elo_judge_model": judge_model})
 
             if elo_error_msg is None:
                 logging.info(f"ELO scores for {model_name} (from solved snapshot): Raw={elo_raw}, Normalized={elo_norm}")
