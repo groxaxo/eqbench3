@@ -1,4 +1,3 @@
-
 # File: ai/eqbench3/core/elo.py
 
 # core/elo.py
@@ -74,6 +73,37 @@ def models_in_comparisons(comps: List[Dict[str, Any]]) -> Set[str]:
         if p.get("test_model"):    mods.add(p["test_model"])
         if p.get("neighbor_model"): mods.add(p["neighbor_model"])
     return mods
+
+
+def _build_fallback_snapshot(ratings: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+    """Build a complete neutral snapshot when no pairwise solve is possible."""
+    default_sigma = 350 / 3
+    snapshot: Dict[str, Dict[str, float]] = {}
+    for model, rating in ratings.items():
+        mu_raw = float(rating)
+        ci_low = mu_raw - 1.96 * default_sigma
+        ci_high = mu_raw + 1.96 * default_sigma
+        snapshot[model] = {
+            "elo": round(mu_raw, 2),
+            "elo_norm": round(mu_raw, 2),
+            "sigma": round(default_sigma, 2),
+            "ci_low": round(ci_low, 2),
+            "ci_high": round(ci_high, 2),
+            "ci_low_norm": round(ci_low, 2),
+            "ci_high_norm": round(ci_high, 2),
+        }
+    return snapshot
+
+
+def _pairwise_ready_models(
+    all_models_scenario_results: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Set[str]:
+    """Return models that actually have at least one task eligible for pairwise judging."""
+    return {
+        model
+        for model, scenario_map in all_models_scenario_results.items()
+        if any(iteration_map for iteration_map in scenario_map.values())
+    }
 # ────────────────────────────────────────────────────────────────────────
 
 
@@ -266,6 +296,7 @@ def run_elo_analysis_eqbench3(
     # ─────────────────────────── SAMPLING LOOP ────────────────────────────
     new_comparisons_generated_this_run = [] # Store only comparisons generated in this execution
     current_existing_matchups = initial_existing_matchups.copy() # Track matchups encountered during this run
+    rank_old = -1
 
     for stage_idx, (radius_tiers, samples) in enumerate(SAMPLING_SCHEDULE, start=1):
         loops, stable = 0, False
@@ -466,6 +497,8 @@ def run_elo_analysis_eqbench3(
     final_snapshot = {} # This will hold the results like {"model_name": {"elo": ..., "elo_norm": ...}}
     # Use the latest elo_snapshot from the sampling loop as a fallback if solve fails
     fallback_snapshot = elo_snapshot
+    pairwise_ready_models = _pairwise_ready_models(all_models_scenario_results)
+    is_single_model_noop = len(pairwise_ready_models) <= 1
 
     try:
         # Filter out ignored scenarios and errors for the final solve
@@ -552,17 +585,30 @@ def run_elo_analysis_eqbench3(
 
             logging.info("[ELO] Final rating calculation and normalization complete.")
 
+        elif is_single_model_noop:
+            logging.info(
+                "[ELO] No pairwise opponent is available yet; storing a neutral "
+                "first-model snapshot without treating this expected state as an error."
+            )
+            final_snapshot = _build_fallback_snapshot(fallback_snapshot)
         else:
             logging.warning("[ELO] No valid comparisons available for final solve.")
-            if not elo_error_message: elo_error_message = "No valid comparisons for final solve"
-            # If solve didn't run, create a basic snapshot from the fallback
-            final_snapshot = {m: {"elo": r, "elo_norm": r} for m, r in fallback_snapshot.items()}
+            if not elo_error_message:
+                elo_error_message = "No valid comparisons for final solve"
+            final_snapshot = _build_fallback_snapshot(fallback_snapshot)
 
     except Exception as e:
-        logging.error(f"[ELO] Final solve or normalization failed: {e}", exc_info=True)
-        if not elo_error_message: elo_error_message = f"Final solve/normalization failed: {e}"
-        # If solve failed, create a basic snapshot from the fallback
-        final_snapshot = {m: {"elo": r, "elo_norm": r} for m, r in fallback_snapshot.items()}
+        if is_single_model_noop and "rank_window" in str(e):
+            logging.warning(
+                "[ELO] Ignoring legacy first-model rank_window failure because no "
+                "pairwise opponent exists yet."
+            )
+            final_snapshot = _build_fallback_snapshot(fallback_snapshot)
+        else:
+            logging.error(f"[ELO] Final solve or normalization failed: {e}", exc_info=True)
+            if not elo_error_message:
+                elo_error_message = f"Final solve/normalization failed: {e}"
+            final_snapshot = _build_fallback_snapshot(fallback_snapshot)
 
 
     # ────────────────── SAVE FINAL RATINGS TO LOCAL ELO FILE ───────────────
