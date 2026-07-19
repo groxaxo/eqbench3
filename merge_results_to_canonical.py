@@ -62,6 +62,78 @@ def setup_merge_logging(level_str):
 # Merge Functionality
 # =========================================================================
 
+def _is_valid_elo_score(value: Any) -> bool:
+    """Return whether *value* represents a usable numeric ELO score."""
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"skipped", "error", "n/a", "none"}:
+            return False
+        try:
+            float(text)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _is_known_stale_first_model_error(error: Any) -> bool:
+    """Identify errors produced solely by the historical no-op first-model path."""
+    if not error:
+        return False
+    message = str(error).lower()
+    return (
+        "rank_window" in message
+        or "no valid comparisons for final solve" in message
+    )
+
+
+def _model_has_matchups(model_name: str, local_elo: Dict[str, Any]) -> bool:
+    """Return True when local ELO contains a real pairwise comparison for a model."""
+    local_comps = local_elo.get("__metadata__", {}).get("global_pairwise_comparisons", [])
+    for comp in local_comps:
+        pair = comp.get("pair", {})
+        if model_name in (pair.get("test_model"), pair.get("neighbor_model")):
+            return True
+    return False
+
+
+def _reconcile_stale_first_model_result(
+    model_name: str,
+    results: Dict[str, Any],
+    local_elo_entry: Dict[str, Any],
+    has_matchups: bool,
+) -> None:
+    """
+    Clear only the known first-model artifact after a later successful solve.
+
+    The local ELO entry plus at least one matchup is the authoritative evidence
+    that this model was subsequently solved. Unrelated judge/API failures remain
+    untouched and continue to block merging.
+    """
+    if not has_matchups or not _is_known_stale_first_model_error(results.get("elo_error")):
+        return
+
+    authoritative_raw = local_elo_entry.get("elo")
+    if not _is_valid_elo_score(authoritative_raw):
+        return
+
+    authoritative_norm = local_elo_entry.get("elo_norm", authoritative_raw)
+    if not _is_valid_elo_score(authoritative_norm):
+        authoritative_norm = authoritative_raw
+
+    logging.info(
+        "Clearing stale first-model ELO error for %s using the later solved local ELO entry.",
+        model_name,
+    )
+    results["elo_raw"] = authoritative_raw
+    results["elo_normalized"] = authoritative_norm
+    results["elo_error"] = None
+
+
 def find_merge_candidates(local_runs, local_elo, canonical_runs, canonical_elo):
     """Identifies runs in local files that meet merge criteria."""
     candidates = []
@@ -98,34 +170,40 @@ def find_merge_candidates(local_runs, local_elo, canonical_runs, canonical_elo):
 
         # --- Check Criteria ---
         # 1. Exists in local ELO?
-        if model_name not in local_elo or not isinstance(local_elo.get(model_name), dict):
+        local_elo_entry = local_elo.get(model_name)
+        if not isinstance(local_elo_entry, dict):
             logging.debug(f"Skipping {model_name} ({run_key}): Missing or invalid entry in local ELO file.")
             continue
 
-        # 2. Completeness (Rubric, ELO scores, Matchups)
-        results = run_data.get("results", {})
+        # A model is mergeable only after at least one real pairwise matchup.
+        has_matchups = _model_has_matchups(model_name, local_elo)
+        if not has_matchups:
+            logging.debug(f"Skipping {model_name} ({run_key}): No matchups found in local ELO comparisons.")
+            continue
+
+        # 2. Completeness (Rubric and ELO scores).
+        results = run_data.get("results")
+        if not isinstance(results, dict):
+            results = {}
+            run_data["results"] = results
+
+        _reconcile_stale_first_model_result(
+            model_name,
+            results,
+            local_elo_entry,
+            has_matchups,
+        )
+
         rubric_score = results.get("average_rubric_score")
         elo_raw = results.get("elo_raw")
         has_rubric = rubric_score is not None and rubric_score != "Skipped" and results.get("rubric_error") is None
-        has_elo = elo_raw is not None and elo_raw != "Skipped" and results.get("elo_error") is None
+        has_elo = _is_valid_elo_score(elo_raw) and results.get("elo_error") is None
 
         if not has_rubric:
             logging.debug(f"Skipping {model_name} ({run_key}): Missing valid Rubric score.")
             continue
         if not has_elo:
             logging.debug(f"Skipping {model_name} ({run_key}): Missing valid ELO score.")
-            continue
-
-        # Check for matchups involving this model in local ELO comparisons
-        has_matchups = False
-        local_comps = local_elo.get("__metadata__", {}).get("global_pairwise_comparisons", [])
-        for comp in local_comps:
-            pair = comp.get("pair", {})
-            if model_name in (pair.get("test_model"), pair.get("neighbor_model")):
-                has_matchups = True
-                break
-        if not has_matchups:
-            logging.debug(f"Skipping {model_name} ({run_key}): No matchups found in local ELO comparisons.")
             continue
 
         # 3. No Name Collision in Canonical Data
